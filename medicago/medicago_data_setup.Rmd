@@ -1,0 +1,268 @@
+# Local PCA on *Medicago truncatula* Hapmap
+
+```{r setup}
+library(lostruct)
+library(Matrix)
+library(colorspace)
+options(width=100)
+fig.dim <- 4
+knitr::opts_chunk$set(fig.width=2*fig.dim,fig.height=fig.dim,fig.align='center')
+```
+
+
+# Data
+
+Filtered SNP calls from Mt4.0 were downloaded from [medicagohapmap.org](http://medicagohapmap.org/) on 5/4/2016:
+```
+mkdir -p data; cd data
+wget http://www.medicagohapmap.org/downloads/Mt40/Mt4.0_HapMap_README.pdf
+for CHROM in 1 2 3 4 5 6 7 8 u;
+do
+    echo "Getting $CHROM"
+    wget http://www.medicagohapmap.org/downloads/Mt40/snps_by_chr/chr${CHROM}-filtered-set-2014Apr15.bcf
+    wget http://www.medicagohapmap.org/downloads/Mt40/snps_by_chr/chr${CHROM}-filtered-set-2014Apr15.csi
+done
+```
+For some reason these .csi index files don't work; so we need to remake them:
+```
+for CHROM in 2 3 4 5 6 7 8 u;
+do
+    bcftools index -f chr${CHROM}-filtered-set-2014Apr15.bcf
+done
+```
+
+## Samples
+
+The file of sample info was obtained from the HTML table at [http://www.medicagohapmap.org/hapmap/germplasm](http://www.medicagohapmap.org/hapmap/germplasm).
+To check this contains information about all samples,
+first get the list of samples in the .bcf files:
+```
+bcftools query -l chr1-filtered-set-2014Apr15.bcf > samples_in_bcf.txt
+```
+then compare to the table of information:
+```{r sample_info}
+samples <- read.table("data/sample_info.tsv", sep="\t", header=TRUE,stringsAsFactors=FALSE)
+bcf.samples <- scan("data/samples_in_bcf.txt", what='char')
+setdiff( bcf.samples , samples$ID )
+```
+For some reason, the bcf files refer to `HM020-I` while in the the sample info file there is `HM020`.
+We'll assume they are the same (but keep an eye on that one!).
+Here's where they're all from:
+```{r show_sample_info}
+wierd.names <- grep("-I",bcf.samples,value=TRUE)
+samples$ID[ match(gsub("-I","",wierd.names),samples$ID) ] <- wierd.names
+samples <- droplevels(subset(samples, ID %in% bcf.samples))
+sort( table(samples$Country.of.Origin) )
+```
+
+## Statistics by chromosome
+
+We should know what the density of SNPs looks like, for choosing window sizes.
+Chromosome lengths are from the VCF files.
+```{r snp_density, cache=TRUE}
+chrom.lens <- c( chr1=52991155, chr2=45729672, chr3=55515152, chr4=56582383, chr5=43630510, chr6=35275713, chr7=49172423, chr8=45569985, chl_Mt=124033 )
+chrom.stats <- sapply( paste0("chr",1:8), function (chrom) {
+            bcf.file <- file.path("data",sprintf("%s-filtered-set-2014Apr15.bcf",chrom))
+            sites <- vcf_positions(bcf.file)
+            spacings <- diff(sites[[chrom]])
+            out <- c( nsnps = length(sites[[chrom]]),
+                    nbp = chrom.lens[chrom],
+                    spacing.mean = mean(spacings),
+                    spacing = quantile(spacings,.05),
+                    spacing = quantile(spacings,.25),
+                    spacing = quantile(spacings,.50),
+                    spacing = quantile(spacings,.75),
+                    spacing = quantile(spacings,.95),
+                    spacing.max = max(spacings,.95) )
+            return(out)
+        } )
+floor(chrom.stats)
+```
+
+So, thats a SNP every 10bp.
+Since we have `r length(bcf.samples)` samples,
+each local PC will take `r 1+length(bcf.samples)` doubles to record;
+a double is 8 bytes;
+so in, say 1Gb we can fit one local PC for `r floor(1e9 / (8*(1+length(bcf.samples))))` windows.
+With a total of `r sum(chrom.stats['nsnps',])` SNPs,
+that'd be `r floor(sum(chrom.stats['nsnps',])/floor(1e9 / (8*(1+length(bcf.samples)))))` SNPs per window.
+A bigger concern is the distance matrix we compute between windows
+(we don't have to save this to disk, though).
+With this many windows, that would be `r floor(1e9 / (8*(1+length(bcf.samples))))^2` floats,
+or `r floor(1e9 / (8*(1+length(bcf.samples))))^2 / 8e9` Gb.
+That's still possible, but barely.
+
+
+## Recoding
+
+Recall that VCF files have the following columns:
+
+> CHROM  POS     ID      REF     ALT     QUAL    FILTER  INFO    FORMAT  
+
+We use [bcftools](https://github.com/samtools/bcftools) to extract information, for instance:
+```
+# list of sites
+bcftools query -f '%CHROM\t%POS\n' -r chr1:1-400 chr1-filtered-set-2014Apr15.bcf
+# genotypes
+bcftools query -f '%CHROM\t%POS[\t%GT]\n' -r chr1:1-400 chr1-filtered-set-2014Apr15.bcf
+# genotypes of first four individuals, numerically
+bcftools query -f '%CHROM\t%POS[\t%GT]\n' -r chr1:1-400 chr1-filtered-set-2014Apr15.bcf -s 'HM001,HM002,HM003,HM004' | sed -e 's_0/0_0_g' -e 's_\(0/1\)\|\(1/0\)_1_g' -e 's_1/1_2_g'
+```
+
+To get windows out of the VCF file and recode them, we'll just pipe a call to `bcftools`.
+Here's a dummy version that will pull out windows of 100 SNPs for only the first four individuals.
+```{r win_fn}
+get.indivs <- c("HM001","HM002","HM003","HM004")
+bcf.file <- "data/chr1-filtered-set-2014Apr15.bcf"
+# first read in the info about sites
+bcf.con <- pipe(paste("bcftools query -f '%POS\\n' -r chr1:1-100000",bcf.file),open="r")
+bcf.sites <- list( chr1=scan(bcf.con) )
+close(bcf.con)
+# now use bcftools to pull out sites we want
+win.fn <- function (n,win.snps=100) {
+    regions <- data.frame( chrom="chr1", start=1+(n-1)*win.snps, end=n*win.snps )
+    vcf_query( bcf.file, regions, get.indivs )
+}
+win.fn(20,10)  # get the 20th window of 10 SNPs
+```
+
+Here's an alternate version that pulls out windows based on basepairs.
+Note that this version assumes we have only one chromosome, starting at zero.
+```{r win_fn_bp}
+win.fn.bp <- function (n,win.bp=200) {
+    win.start <- 1+(n-1)*win.bp
+    win.end <- win.start + win.bp-1
+    regions <- data.frame( chrom="chr1", start=win.start, end=win.end )
+    vcf_query( bcf.file, regions, get.indivs )
+}
+win.fn.bp(20,50)
+```
+
+
+## Computing eigenvectors of covariance matrices
+
+Now we are set up to use `lostruct::eigen_windows()` to compute and write out the eigenstructure for windows along the genome.
+
+Here's how to do that for the first 4 windows of length 100 SNPs, with the simplified version: just four individuals.
+```{r simple_snp_pcas}
+eigen_windows( 
+        data=win.fn,
+        do.windows=1:4,
+        k=2,
+        win.snps=100
+    )
+```
+Here's the same thing on windows of length 1000bps:
+```{r simple_bp_pcas}
+eigen_windows( 
+        data=win.fn.bp,
+        do.windows=1:4,
+        k=2,
+        win.bp=1000
+    )
+```
+
+
+## Doing this for everything
+
+Now let's see how it goes to do this for an entire chromosome.
+On chromosome 1 there are about 5 million SNPs, so we'll do it in windows of 5,000.
+First, windows by SNPs.
+```{r lpca_chr1_snp, cache=TRUE}
+sites <- vcf_positions(bcf.file)
+do.indivs <- sample( samples$ID, 50 )
+win.fn.snp <- vcf_windower(bcf.file, size=5e3, type="snp", sites=sites, samples=do.indivs) 
+system.time( snp.pca <- eigen_windows(win.fn.snp,k=2) )
+```
+It takes about 2 minutes to do chromosome 1, for ten individuals, on phoebe.
+Next, we compute the distance between windows with `pc_dist()` and do MDS visualization on the result.
+This is just with ten samples, so we don't expect a real result, but let's check it all works:
+```{r mds_chr1_snp, cache=TRUE, depends="lpca_chr1_snp"}
+system.time( chr1.pcdist <- pc_dist( snp.pca ) )
+# there may be windows with missing data
+na.inds <- is.na( snp.pca[1,] )
+chr1.mds <- cmdscale( chr1.pcdist[!na.inds,!na.inds], eig=TRUE, k=4 )
+mds.coords <- chr1.mds$points[ ifelse( na.inds, NA, cumsum(!na.inds) ), ]
+colnames(mds.coords) <- paste("MDS coordinate", 1:ncol(mds.coords))
+```
+
+## Visualization
+
+Here's the results:
+```{r show_results_snp}
+# the distance matrix itself
+image( Matrix( chr1.pcdist ) )
+# the MDS results
+win.regions <- region(win.fn.snp)()
+win.mids <- (win.regions$start+win.regions$end)/2
+chrom.cols <- rainbow_hcl(128, c=90, end=.9*360)[as.numeric(cut(win.mids,128))]
+pairs( mds.coords, pch=20, col=adjustcolor(chrom.cols,0.75) )
+```
+
+Now let's extract the extreme windows in the MDS plot:
+```{r get_corners}
+mincirc <- lostruct:::enclosing_circle( mds.coords[,1:2] )
+mds.corners <- corners( mds.coords[,1:2], prop=.05 )
+corner.cols <- c("red","blue","purple")
+ccols <- rep("black",nrow(mds.coords))
+for (k in 1:ncol(mds.corners)) {
+    ccols[ mds.corners[,k] ] <- corner.cols[k]
+}
+plot( mds.coords[,1:2], pch=20, col=adjustcolor(ccols,0.75), 
+        xlab="MDS coordinate 1", ylab="MDS coordinate 2", 
+        xlim=mincirc$ctr[1]+c(-1,1)*mincirc$rad,
+        ylim=mincirc$ctr[2]+c(-1,1)*mincirc$rad )
+plot_circle( mincirc, col='red' )
+points( mincirc$three, col='red', cex=2 )
+points( mds.coords[mincirc$index,], col='red', cex=1.5 )
+```
+
+Here is where these lie along the chromosomes:
+```{r show_corners}
+for (k in 1:ncol(mds.coords)) {
+    plot( win.mids/1e6, mds.coords[,k], pch=20, 
+            xlab="Position (Mb)", ylab=paste("MDS coordinate",k),
+            col=adjustcolor(ccols,0.75) )
+}
+```
+
+And, here are the PCA plots corresponding to these corners:
+```{r pc_corners, cache=TRUE, depends="mds_chr1_snp"}
+corner.winfn <- function (n) { win.fn.snp( mds.corners[,n] ) }
+corner.pcs <- eigen_windows( data=corner.winfn, 
+                    k=2, do.windows=1:ncol(mds.corners) )
+```
+
+```{r plot_pc_corners}
+countries <- samples$Country.of.Origin[match(do.indivs,samples$ID)]
+country.names <- unique(countries)
+country.cols <- rainbow_hcl( length(country.names), c=90 )
+country.pch <- rep(1:6,length.out=length(country.names))
+for (k in 1:nrow(corner.pcs)) {
+    xy <- matrix( corner.pcs[k,-(1:3)], ncol=2 )
+    plot(xy, xlab="PC 1", ylab="PC 2", main=paste("corner",k), 
+            col=country.cols[match(countries,country.names)], 
+            pch=country.pch[match(countries,country.names)]  )
+}
+legend('topright', col=country.cols, pch=country.pch, legend=country.names)
+```
+
+## Weights
+
+To check the effect of subsampling,
+here's a way to make a file of weights:
+```{r make_weights}
+samples$nsamples <- table(samples$Country.of.Origin)[samples$Country.of.Origin]
+samples$weight <- 1/pmax(10,samples$nsamples)
+
+bcf.samples <- vcf_samples("data/chr1-filtered-set-2014Apr15.bcf")
+bcf.samples[bcf.samples=="HM020-I"] <- "HM020"
+
+weights <- data.frame( ID=bcf.samples, weight=samples$weight[match(bcf.samples,samples$ID)] )
+
+write.table(weights, sep="\t", file="data/inverse-samplesize-weights.tsv", row.names=FALSE)
+```
+
+## Gene location information
+
+Non-TE related gene data downloaded from [jcvi.org's JBrowse](http://jcvi.org/medicago/jbrowse/?data=data%2Fjson%2Fmedicago&loc=chr1%3A9010377..51403300&tracks=gene_models&highlight=) on 4 September 2015.
